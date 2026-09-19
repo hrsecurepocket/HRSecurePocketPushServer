@@ -441,28 +441,34 @@ const otpIpLimiter = rateLimit({
   legacyHeaders: false
 });
 
-// Firebase ID token verify করে uid বের করা — এটাই "user authentication verify করা"
-async function verifyAuthToken(req) {
-  const idToken = req.body.idToken || (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  if (!idToken) return null;
+// ⚠️ ডিজাইন নোট: idToken (লগইন থাকা লাগে) এর বদলে email ব্যবহার করা হচ্ছে — কারণ Forgot Password
+// ঠিক তখনই দরকার হয় যখন ইউজার লগইনই করতে পারছে না (পাসওয়ার্ড ভুলে গেছে), তখন কোনো idToken থাকে না।
+// ইমেইলে OTP পাঠানো আর সেটা সঠিকভাবে verify করাটাই এখানে "সে-ই একাউন্টের মালিক" এর প্রমাণ —
+// standard password-reset security pattern। এই একই তিনটা API Login পেজের "Forgot Password"
+// এবং Settings পেজের "Change Password" — দুই জায়গাতেই ব্যবহার করা যায়।
+async function getUidByEmail(email) {
   try {
-    return await admin.auth().verifyIdToken(idToken);
+    const userRecord = await admin.auth().getUserByEmail(email);
+    return userRecord.uid;
   } catch (e) {
-    return null;
+    return null; // এই email-এ কোনো একাউন্ট নেই
   }
 }
 
 // ── OTP request ──
-// POST /request-password-otp   { idToken }
+// POST /request-password-otp   { email }
 app.post('/request-password-otp', otpIpLimiter, async (req, res) => {
   try {
-    const decoded = await verifyAuthToken(req);
-    if (!decoded) return res.status(401).json({ success: false, error: 'Invalid or missing auth token' });
-    const uid = decoded.uid;
+    const email = (req.body.email || '').trim().toLowerCase();
+    if (!email) return res.status(400).json({ success: false, error: 'email required' });
 
-    const userRecord = await admin.auth().getUser(uid);
-    const email = userRecord.email;
-    if (!email) return res.status(400).json({ success: false, error: 'No email on this account' });
+    const uid = await getUidByEmail(email);
+    // ⚠️ নিরাপত্তার জন্য: email registered না থাকলেও একই success message দেওয়া হয়,
+    // যাতে কেউ এই API দিয়ে "কোন কোন ইমেইলে একাউন্ট আছে" যাচাই (enumerate) করতে না পারে।
+    if (!uid) {
+      console.log(`[password-otp] OTP requested for unregistered email: ${email}`);
+      return res.json({ success: true, message: 'যদি এই ইমেইলে একাউন্ট থাকে, OTP পাঠানো হয়েছে' });
+    }
 
     if (!isOtpRequestAllowed(uid)) {
       return res.status(429).json({
@@ -485,7 +491,7 @@ app.post('/request-password-otp', otpIpLimiter, async (req, res) => {
 
     await sendOtpEmail(email, otp);
     console.log(`[password-otp] OTP sent (uid: ${uid})`);
-    res.json({ success: true, message: 'OTP sent to your email' });
+    res.json({ success: true, message: 'যদি এই ইমেইলে একাউন্ট থাকে, OTP পাঠানো হয়েছে' });
   } catch (e) {
     console.error('request-password-otp error:', e.message);
     res.status(500).json({ success: false, error: e.message });
@@ -493,14 +499,16 @@ app.post('/request-password-otp', otpIpLimiter, async (req, res) => {
 });
 
 // ── OTP verify ──
-// POST /verify-password-otp   { idToken, otp }
+// POST /verify-password-otp   { email, otp }
 app.post('/verify-password-otp', async (req, res) => {
   try {
-    const decoded = await verifyAuthToken(req);
-    if (!decoded) return res.status(401).json({ success: false, error: 'Invalid or missing auth token' });
-    const uid = decoded.uid;
+    const email = (req.body.email || '').trim().toLowerCase();
     const { otp } = req.body;
+    if (!email)  return res.status(400).json({ success: false, error: 'email required' });
     if (!otp) return res.status(400).json({ success: false, error: 'otp required' });
+
+    const uid = await getUidByEmail(email);
+    if (!uid) return res.status(400).json({ success: false, error: 'ভুল OTP' }); // enumerate আটকাতে generic error
 
     const doc = await otpDocRef(uid).get();
     if (!doc.exists) return res.status(400).json({ success: false, error: 'কোনো OTP request করা হয়নি, আগে request করুন।' });
@@ -530,16 +538,18 @@ app.post('/verify-password-otp', async (req, res) => {
 });
 
 // ── Password change (শুধু OTP verify হওয়ার পরেই কাজ করবে) ──
-// POST /change-password   { idToken, newPassword }
+// POST /change-password   { email, newPassword }
 app.post('/change-password', async (req, res) => {
   try {
-    const decoded = await verifyAuthToken(req);
-    if (!decoded) return res.status(401).json({ success: false, error: 'Invalid or missing auth token' });
-    const uid = decoded.uid;
+    const email = (req.body.email || '').trim().toLowerCase();
     const { newPassword } = req.body;
+    if (!email) return res.status(400).json({ success: false, error: 'email required' });
     if (!newPassword || newPassword.length < 6) {
       return res.status(400).json({ success: false, error: 'Password must be at least 6 characters' });
     }
+
+    const uid = await getUidByEmail(email);
+    if (!uid) return res.status(400).json({ success: false, error: 'আগে OTP verify করুন।' });
 
     const doc = await otpDocRef(uid).get();
     if (!doc.exists || !doc.data().verified) {
