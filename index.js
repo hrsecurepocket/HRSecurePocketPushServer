@@ -3,10 +3,12 @@ const admin       = require('firebase-admin');
 const bodyParser  = require('body-parser');
 const cors        = require('cors');
 const bcrypt      = require('bcryptjs');
-const nodemailer  = require('nodemailer');
+const { google }  = require('googleapis');
 const rateLimit   = require('express-rate-limit');
 
 const app = express();
+app.set('trust proxy', 1); // ✅ Render একটা proxy-এর পেছনে চলে, এটা না থাকলে express-rate-limit
+                            // ERR_ERL_UNEXPECTED_X_FORWARDED_FOR এরর দেয়
 app.use(cors());
 app.use(bodyParser.json());
 
@@ -396,28 +398,54 @@ function generateOtp() {
   return String(Math.floor(100000 + Math.random() * 900000)); // 6-digit
 }
 
-// Gmail SMTP + App Password (আসল Gmail password না) — env var না থাকলে transport null থাকবে,
-// আর OTP পাঠানোর চেষ্টা হলে স্পষ্ট এরর দেবে, সার্ভার ক্র্যাশ করবে না।
-const mailTransport = (process.env.SMTP_USER && process.env.SMTP_PASS)
-  ? nodemailer.createTransport({
-      host: process.env.SMTP_HOST || 'smtp.gmail.com',
-      port: parseInt(process.env.SMTP_PORT || '587', 10),
-      secure: false,
-      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-    })
+// ✅ Gmail REST API (HTTPS, পোর্ট 443) দিয়ে ইমেইল পাঠানো হয় — raw SMTP (পোর্ট 465/587) ব্যবহার
+// করা হয় না, কারণ Render-এর ফ্রি টায়ার SMTP পোর্ট সম্পূর্ণ ব্লক করে রাখে (২০২৫ সাল থেকে)।
+// GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET / GMAIL_REFRESH_TOKEN — Google Cloud Console (OAuth2)
+// থেকে বানানো, GMAIL_SENDER_EMAIL সেই একাউন্টের ইমেইল ঠিকানা।
+const gmailOAuth2Client = (process.env.GMAIL_CLIENT_ID && process.env.GMAIL_CLIENT_SECRET)
+  ? new google.auth.OAuth2(
+      process.env.GMAIL_CLIENT_ID,
+      process.env.GMAIL_CLIENT_SECRET,
+      'https://developers.google.com/oauthplayground'
+    )
   : null;
+if (gmailOAuth2Client && process.env.GMAIL_REFRESH_TOKEN) {
+  gmailOAuth2Client.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN });
+}
+
+function buildRawEmail(from, to, subject, html) {
+  const encodedSubject = `=?utf-8?B?${Buffer.from(subject, 'utf-8').toString('base64')}?=`;
+  const message = [
+    `From: HR Secure Pocket <${from}>`,
+    `To: ${to}`,
+    'Content-Type: text/html; charset=utf-8',
+    'MIME-Version: 1.0',
+    `Subject: ${encodedSubject}`,
+    '',
+    html
+  ].join('\r\n');
+
+  return Buffer.from(message, 'utf-8')
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
 
 async function sendOtpEmail(toEmail, otp) {
-  if (!mailTransport) throw new Error('Email service not configured (SMTP_USER/SMTP_PASS missing)');
-  await mailTransport.sendMail({
-    from: `"HR Secure Pocket" <${process.env.SMTP_USER}>`,
-    to: toEmail,
-    subject: 'Your Password Change OTP - HR Secure Pocket',
-    text: `আপনার OTP কোড: ${otp}\n\nএই কোডটি ${OTP_EXPIRY_MINUTES} মিনিটের জন্য কার্যকর। কাউকে শেয়ার করবেন না।`,
-    html: `<p>আপনার পাসওয়ার্ড পরিবর্তনের OTP কোড:</p>`
-        + `<h2 style="letter-spacing:4px">${otp}</h2>`
-        + `<p>এই কোডটি <b>${OTP_EXPIRY_MINUTES} মিনিটের</b> জন্য কার্যকর। কাউকে শেয়ার করবেন না।</p>`
-  });
+  if (!gmailOAuth2Client || !process.env.GMAIL_REFRESH_TOKEN || !process.env.GMAIL_SENDER_EMAIL) {
+    throw new Error('Gmail API not configured (GMAIL_CLIENT_ID/GMAIL_CLIENT_SECRET/GMAIL_REFRESH_TOKEN/GMAIL_SENDER_EMAIL missing)');
+  }
+
+  const subject = 'Your Password Change OTP - HR Secure Pocket';
+  const html = `<p>আপনার পাসওয়ার্ড পরিবর্তনের OTP কোড:</p>`
+      + `<h2 style="letter-spacing:4px">${otp}</h2>`
+      + `<p>এই কোডটি <b>${OTP_EXPIRY_MINUTES} মিনিটের</b> জন্য কার্যকর। কাউকে শেয়ার করবেন না।</p>`;
+
+  const raw = buildRawEmail(process.env.GMAIL_SENDER_EMAIL, toEmail, subject, html);
+
+  const gmail = google.gmail({ version: 'v1', auth: gmailOAuth2Client });
+  await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
 }
 
 // সাধারণ in-memory per-uid rate limiter (single Render instance ধরে নিয়ে — একাধিক instance-এ
