@@ -62,6 +62,26 @@ app.get('/', (req, res) => {
   res.send('Wevlo Push Notification Server is Running!');
 });
 
+// ✅ Google OAuth consent screen (Gmail API publish) এর জন্য দরকার — শুধু একটা সাধারণ,
+// সবসময়-লোড-হওয়া static পেজ, existing কোনো ফাংশনালিটির সাথে সম্পর্কহীন।
+app.get('/privacy', (req, res) => {
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="bn">
+<head><meta charset="utf-8"><title>Privacy Policy - HR Secure Pocket</title></head>
+<body style="font-family: sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; line-height: 1.6;">
+  <h1>Privacy Policy</h1>
+  <p>This server is used internally by HR Secure Pocket for:</p>
+  <ul>
+    <li>Sending push notifications to the HR Secure Pocket user and admin apps</li>
+    <li>Sending one-time password (OTP) emails for password-reset requests</li>
+  </ul>
+  <p>We do not sell or share user data with third parties. Email addresses are used only
+     to deliver OTP codes requested by the account owner.</p>
+  <p>Contact: hrsecurepocket@gmail.com</p>
+</body>
+</html>`);
+});
+
 // ── Debug: দেখো এখন সার্ভারে কোন credential লোড হয়েছে ──
 // GET /debug
 app.get('/debug', (req, res) => {
@@ -597,6 +617,115 @@ app.post('/change-password', async (req, res) => {
     res.json({ success: true, message: 'Password changed successfully' });
   } catch (e) {
     console.error('change-password error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════
+// ✅ NEW: SIGNUP EMAIL VERIFICATION (আলাদা সিস্টেম — password OTP-এর সাথে মেশানো হয়নি,
+// যাতে দুইটা ফিচার একে অপরের state নষ্ট না করে)
+// ════════════════════════════════════════════════════════════
+
+function signupOtpDocRef(uid) {
+  return db.collection('signup_otps').doc(uid);
+}
+
+const signupOtpRequestLog = new Map(); // uid -> [timestamps], password-otp লিমিটার থেকে আলাদা
+function isSignupOtpRequestAllowed(uid) {
+  const now = Date.now();
+  const windowMs = OTP_REQUEST_WINDOW_MIN * 60 * 1000;
+  const list = (signupOtpRequestLog.get(uid) || []).filter(t => now - t < windowMs);
+  if (list.length >= OTP_REQUEST_LIMIT) { signupOtpRequestLog.set(uid, list); return false; }
+  list.push(now);
+  signupOtpRequestLog.set(uid, list);
+  return true;
+}
+
+async function sendSignupOtpEmail(toEmail, otp) {
+  if (!gmailOAuth2Client || !process.env.GMAIL_REFRESH_TOKEN || !process.env.GMAIL_SENDER_EMAIL) {
+    throw new Error('Gmail API not configured (GMAIL_CLIENT_ID/GMAIL_CLIENT_SECRET/GMAIL_REFRESH_TOKEN/GMAIL_SENDER_EMAIL missing)');
+  }
+  const subject = 'Verify your email - HR Secure Pocket';
+  const html = `<p>HR Secure Pocket-এ তোমার একাউন্ট ভেরিফাই করতে এই কোডটা ব্যবহার করো:</p>`
+      + `<h2 style="letter-spacing:4px">${otp}</h2>`
+      + `<p>এই কোডটি <b>${OTP_EXPIRY_MINUTES} মিনিটের</b> জন্য কার্যকর। কাউকে শেয়ার করবেন না।</p>`;
+  const raw = buildRawEmail(process.env.GMAIL_SENDER_EMAIL, toEmail, subject, html);
+  const gmail = google.gmail({ version: 'v1', auth: gmailOAuth2Client });
+  await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
+}
+
+// ── Signup OTP request ──
+// POST /request-signup-otp   { uid, email }
+// (uid ইউজার অ্যাপ থেকে পাঠানো হয় — রেজিস্ট্রেশনের ঠিক পরপরই, ইউজার তখন আগে থেকেই
+// Firebase Auth-এ লগইন করা থাকে বলে তার নিজের uid জানে)
+app.post('/request-signup-otp', otpIpLimiter, async (req, res) => {
+  try {
+    const uid = (req.body.uid || '').trim();
+    const email = (req.body.email || '').trim().toLowerCase();
+    if (!uid || !email) return res.status(400).json({ success: false, error: 'uid and email required' });
+
+    if (!isSignupOtpRequestAllowed(uid)) {
+      return res.status(429).json({
+        success: false,
+        error: `একটু পর আবার চেষ্টা করুন (${OTP_REQUEST_WINDOW_MIN} মিনিটে সর্বোচ্চ ${OTP_REQUEST_LIMIT} বার OTP চাওয়া যায়)`
+      });
+    }
+
+    const otp = generateOtp();
+    const otpHash = await bcrypt.hash(otp, 10);
+
+    await signupOtpDocRef(uid).set({
+      otpHash,
+      email,
+      attempts: 0,
+      verified: false,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000
+    });
+
+    await sendSignupOtpEmail(email, otp);
+    console.log(`[signup-otp] OTP sent (uid: ${uid})`);
+    res.json({ success: true, message: 'OTP sent to your email' });
+  } catch (e) {
+    console.error('request-signup-otp error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ── Signup OTP verify ──
+// POST /verify-signup-otp   { uid, otp }
+app.post('/verify-signup-otp', async (req, res) => {
+  try {
+    const uid = (req.body.uid || '').trim();
+    const { otp } = req.body;
+    if (!uid) return res.status(400).json({ success: false, error: 'uid required' });
+    if (!otp) return res.status(400).json({ success: false, error: 'otp required' });
+
+    const doc = await signupOtpDocRef(uid).get();
+    if (!doc.exists) return res.status(400).json({ success: false, error: 'কোনো OTP request করা হয়নি, আগে request করুন।' });
+
+    const data = doc.data();
+    if (Date.now() > data.expiresAt) {
+      await signupOtpDocRef(uid).delete();
+      return res.status(400).json({ success: false, error: 'OTP মেয়াদ শেষ হয়ে গেছে, আবার request করুন।' });
+    }
+    if (data.attempts >= OTP_MAX_ATTEMPTS) {
+      await signupOtpDocRef(uid).delete();
+      return res.status(400).json({ success: false, error: 'অনেকবার ভুল OTP দেওয়া হয়েছে, আবার নতুন OTP request করুন।' });
+    }
+
+    const match = await bcrypt.compare(String(otp), data.otpHash);
+    if (!match) {
+      await signupOtpDocRef(uid).update({ attempts: admin.firestore.FieldValue.increment(1) });
+      return res.status(400).json({ success: false, error: 'ভুল OTP' });
+    }
+
+    await signupOtpDocRef(uid).delete(); // এক-বার ব্যবহারের পর মুছে ফেলা — verified স্ট্যাটাস এখন
+                                          // ইউজার অ্যাপ নিজেই users/{uid}/emailVerified এ লিখবে
+    console.log(`[signup-otp] Verified (uid: ${uid})`);
+    res.json({ success: true, message: 'Email verified' });
+  } catch (e) {
+    console.error('verify-signup-otp error:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
